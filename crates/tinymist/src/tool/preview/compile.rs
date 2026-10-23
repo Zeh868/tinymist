@@ -9,6 +9,7 @@ use tinymist_preview::{
 };
 use tinymist_project::LspCompiledArtifact;
 use tinymist_query::{jump_from_click, jump_from_cursor};
+use typst::diag::Severity;
 use typst::layout::{Abs, Point, Position};
 use typst::syntax::{LinkedNode, Source, Span, SyntaxKind};
 use typst::World;
@@ -101,6 +102,23 @@ impl tinymist_preview::CompileView for PreviewCompileView {
             Some(_) => CompileStatus::CompileSuccess,
             None => CompileStatus::CompileError,
         }
+    }
+
+    fn compile_errors(&self) -> Vec<String> {
+        const MAX_ERRORS: usize = 5;
+        const MAX_MESSAGE_LEN: usize = 200;
+
+        self.art
+            .diagnostics()
+            .filter(|diag| diag.severity == Severity::Error)
+            .take(MAX_ERRORS)
+            .map(|diag| {
+                // Multi-line messages are common (message + hints); keep the
+                // first line only and truncate to a sane length.
+                let first_line = diag.message.lines().next().unwrap_or_default();
+                first_line.chars().take(MAX_MESSAGE_LEN).collect()
+            })
+            .collect()
     }
 
     fn is_on_saved(&self) -> bool {

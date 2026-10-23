@@ -23,6 +23,7 @@ pub struct ResolveSpanRequest(pub Vec<ElementPoint>);
 pub enum RenderActorRequest {
     RenderFullLatest,
     RenderIncremental,
+    RenderError { errors: Vec<String> },
     EditorResolveSpanRange(Range<SourceSpanOffset>),
     WebviewResolveSpan(ResolveSpanRequest),
     WebviewResolveFrameLoc(DocumentPosition),
@@ -35,6 +36,7 @@ impl RenderActorRequest {
         match self {
             Self::RenderFullLatest => true,
             Self::RenderIncremental => false,
+            Self::RenderError { .. } => false,
             Self::EditorResolveSpanRange(_) => false,
             Self::WebviewResolveSpan(_) => false,
             Self::ResolveSourceLoc(_) => false,
@@ -126,6 +128,20 @@ impl RenderActor {
                 log::debug!("RenderActor: processing ChangeCursorPosition: {req:?}");
 
                 self.change_cursor_position(req);
+            }
+            RenderActorRequest::RenderError { errors } => {
+                // Only the server_svg data plane has a text-frame protocol to
+                // carry this; the browser webview protocol has no error frame.
+                if self.server_svg {
+                    let payload = serde_json::json!({
+                        "kind": "compileError",
+                        "errors": errors,
+                    });
+                    let frame = format!("error\n{payload}\n");
+                    if self.svg_sender.send(frame.into_bytes()).is_err() {
+                        log::info!("RenderActor: svg_sender is dropped");
+                    }
+                }
             }
             RenderActorRequest::RenderFullLatest | RenderActorRequest::RenderIncremental => {}
         }

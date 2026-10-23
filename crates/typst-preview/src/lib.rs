@@ -416,6 +416,11 @@ pub trait CompileView: Send + Sync {
         None
     }
 
+    /// Get short error messages of a failed compilation.
+    fn compile_errors(&self) -> Vec<String> {
+        Vec::new()
+    }
+
     /// Resolve a physical location in the document.
     fn resolve_frame_loc(
         &self,
@@ -480,7 +485,19 @@ impl CompileWatcher {
                     CompileStatus::CompileSuccess,
                 ));
             }
-            CompileStatus::Compiling | CompileStatus::CompileError => {
+            CompileStatus::CompileError => {
+                // The view holds no document on error. Clear the cached one
+                // so the renderer doesn't resend stale pages over the error
+                // frame.
+                *self.doc_sender.write() = None;
+                let _ = self.render_tx.send(RenderActorRequest::RenderError {
+                    errors: view.compile_errors(),
+                });
+                let _ = self
+                    .editor_tx
+                    .send(EditorActorRequest::CompileStatus(status));
+            }
+            CompileStatus::Compiling => {
                 let _ = self
                     .editor_tx
                     .send(EditorActorRequest::CompileStatus(status));
