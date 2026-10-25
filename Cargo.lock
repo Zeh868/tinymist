@@ -7013,6 +7013,7 @@ dependencies = [
  "typst-assets",
  "typst-html",
  "typst-macros",
+ "typst-svg",
  "typst-timing 0.15.1",
 ]
 

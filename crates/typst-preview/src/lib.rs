@@ -59,6 +59,13 @@ pub struct PreviewConfig {
     pub refresh_style: TaskWhen,
     /// The invert colors setting for the preview.
     pub invert_colors: String,
+    /// When true, render complete SVG server-side and send as text WebSocket
+    /// messages instead of binary vector IR.
+    pub server_svg: bool,
+    /// When true (and `server_svg` is also true), strip unchanged glyph
+    /// `<defs>` from SVGs after the first frame. The receiving client must
+    /// cache and re-inject the stripped defs.
+    pub strip_svg_glyph_defs: bool,
 }
 
 /// Gets the HTML for the frontend by a given preview mode and server to connect
@@ -188,6 +195,7 @@ impl Previewer {
                     h.webview_tx.subscribe(),
                     h.editor_tx.clone(),
                     h.renderer_tx.clone(),
+                    h.server_svg,
                 );
                 match h.format {
                     ExportTarget::Paged => {
@@ -197,6 +205,8 @@ impl Previewer {
                             h.editor_tx.clone(),
                             svg.0,
                             h.webview_tx,
+                            h.server_svg,
+                            h.strip_svg_glyph_defs,
                         );
                         tokio::spawn(render_actor.run());
                         let outline_render_actor = actor::render::OutlineRenderActor::new(
@@ -349,6 +359,8 @@ impl PreviewBuilder {
             renderer_tx: renderer_mailbox.0.clone(),
             enable_partial_rendering: config.enable_partial_rendering,
             doc_sender,
+            server_svg: config.server_svg,
+            strip_svg_glyph_defs: config.strip_svg_glyph_defs,
         };
 
         Previewer {
@@ -513,6 +525,11 @@ pub trait CompileView: Send + Sync {
     /// Get the compile status.
     fn status(&self) -> CompileStatus;
 
+    /// Get short error messages of a failed compilation.
+    fn compile_errors(&self) -> Vec<String> {
+        Vec::new()
+    }
+
     /// Check if the view is by OnSaved event.
     fn is_on_saved(&self) -> bool;
     /// Check if the view is by entry update.
@@ -587,7 +604,19 @@ impl CompileWatcher {
                     CompileStatus::CompileSuccess,
                 ));
             }
-            CompileStatus::Compiling | CompileStatus::CompileError => {
+            CompileStatus::CompileError => {
+                // The view holds no document on error. Clear the cached one
+                // so the renderer doesn't resend stale pages over the error
+                // frame.
+                *self.doc_sender.write() = None;
+                let _ = self.render_tx.send(RenderActorRequest::RenderError {
+                    errors: view.compile_errors(),
+                });
+                let _ = self
+                    .editor_tx
+                    .send(EditorActorRequest::CompileStatus(status));
+            }
+            CompileStatus::Compiling => {
                 let _ = self
                     .editor_tx
                     .send(EditorActorRequest::CompileStatus(status));
@@ -606,6 +635,8 @@ struct DataPlane {
     invert_colors: String,
     renderer_tx: broadcast::Sender<RenderActorRequest>,
     doc_sender: Arc<parking_lot::RwLock<Option<Arc<dyn CompileView>>>>,
+    server_svg: bool,
+    strip_svg_glyph_defs: bool,
 }
 
 /// The invert colors for the preview.

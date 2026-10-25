@@ -661,6 +661,8 @@ impl Config {
             refresh_style: self.preview.refresh.clone().unwrap_or(TaskWhen::OnType),
             invert_colors: serde_json::to_string(&self.preview.invert_colors)
                 .unwrap_or_else(|_| "never".to_string()),
+            server_svg: false,
+            strip_svg_glyph_defs: false,
         }
     }
 
@@ -1928,6 +1930,8 @@ mod tests {
         assert!(!config.enable_partial_rendering);
         assert_eq!(config.refresh_style, TaskWhen::OnType);
         assert_eq!(config.invert_colors, "\"never\"");
+        assert!(!config.server_svg);
+        assert!(!config.strip_svg_glyph_defs);
     }
 
     #[test]
