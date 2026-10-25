@@ -128,6 +128,21 @@ pub struct PreviewArgs {
     /// This is hidden from the CLI.
     #[clap(long, hide(true))]
     pub refresh_style: Option<RefreshStyle>,
+
+    /// Render complete SVG server-side instead of streaming vector IR.
+    ///
+    /// When enabled, the WebSocket data plane sends SVG text messages
+    /// instead of binary reflexo vector IR. Intended for native editor
+    /// integrations that can rasterize SVG directly.
+    #[clap(long = "server-svg")]
+    pub server_svg: bool,
+
+    /// Strip unchanged glyph defs from SVGs after the first frame.
+    ///
+    /// Requires `--server-svg`. The receiving client must cache and
+    /// re-inject the stripped defs.
+    #[clap(long = "strip-svg-glyph-defs")]
+    pub strip_svg_glyph_defs: bool,
 }
 
 /// Resolves the browser page title for preview HTML.
@@ -158,6 +173,8 @@ impl PreviewArgs {
                 Some(s) => s.clone(),
                 None => config.invert_colors.clone(),
             },
+            server_svg: self.server_svg || config.server_svg,
+            strip_svg_glyph_defs: self.strip_svg_glyph_defs || config.strip_svg_glyph_defs,
         }
     }
 }

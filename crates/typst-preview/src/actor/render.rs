@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+use std::hash::{DefaultHasher, Hasher};
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -16,6 +18,7 @@ use crate::{CompileView, DocToSrcJumpInfo, ResolveSourceLocRequest};
 pub enum RenderActorRequest {
     RenderFullLatest,
     RenderIncremental,
+    RenderError { errors: Vec<String> },
     EditorResolveSpanRange(Range<SourceSpanOffset>),
     WebviewResolveFrameLoc(DocumentPosition),
     ResolveSourceLoc(ResolveSourceLocRequest),
@@ -26,6 +29,7 @@ impl RenderActorRequest {
         match self {
             Self::RenderFullLatest => true,
             Self::RenderIncremental => false,
+            Self::RenderError { .. } => false,
             Self::EditorResolveSpanRange(_) => false,
             Self::ResolveSourceLoc(_) => false,
             Self::WebviewResolveFrameLoc(_) => false,
@@ -40,6 +44,9 @@ pub struct RenderActor {
     editor_conn_sender: mpsc::UnboundedSender<EditorActorRequest>,
     svg_sender: mpsc::UnboundedSender<Vec<u8>>,
     webview_sender: broadcast::Sender<WebviewActorRequest>,
+    server_svg: bool,
+    strip_svg_glyph_defs: bool,
+    cached_glyph_defs_hashes: HashMap<usize, u64>,
 }
 
 impl RenderActor {
@@ -49,6 +56,8 @@ impl RenderActor {
         editor_conn_sender: mpsc::UnboundedSender<EditorActorRequest>,
         svg_sender: mpsc::UnboundedSender<Vec<u8>>,
         webview_sender: broadcast::Sender<WebviewActorRequest>,
+        server_svg: bool,
+        strip_svg_glyph_defs: bool,
     ) -> Self {
         Self {
             mailbox,
@@ -57,6 +66,9 @@ impl RenderActor {
             editor_conn_sender,
             svg_sender,
             webview_sender,
+            server_svg,
+            strip_svg_glyph_defs,
+            cached_glyph_defs_hashes: HashMap::new(),
         }
     }
 
@@ -88,6 +100,16 @@ impl RenderActor {
                 log::debug!("RenderActor: resolving ResolveSourceLoc: {req:?}");
 
                 self.resolve_source_loc(req);
+            }
+            RenderActorRequest::RenderError { errors } => {
+                // Only the server_svg data plane has a text-frame protocol to
+                // carry this; the browser webview protocol has no error frame.
+                if self.server_svg {
+                    let frame = compile_error_frame(&errors);
+                    if self.svg_sender.send(frame.into_bytes()).is_err() {
+                        log::info!("RenderActor: svg_sender is dropped");
+                    }
+                }
             }
             RenderActorRequest::RenderFullLatest | RenderActorRequest::RenderIncremental => {}
         }
@@ -124,13 +146,61 @@ impl RenderActor {
                 continue;
             };
 
-            let data = self.render(has_full_render, &document);
-            let Ok(_) = self.svg_sender.send(data) else {
-                log::info!("RenderActor: svg_sender is dropped");
-                break;
-            };
+            if self.server_svg {
+                let pages = self.render_svg(&document);
+                let mut sender_dropped = false;
+                for page_data in pages {
+                    if self.svg_sender.send(page_data).is_err() {
+                        log::info!("RenderActor: svg_sender is dropped");
+                        sender_dropped = true;
+                        break;
+                    }
+                }
+                if sender_dropped {
+                    break;
+                }
+            } else {
+                let data = self.render(has_full_render, &document);
+                let Ok(_) = self.svg_sender.send(data) else {
+                    log::info!("RenderActor: svg_sender is dropped");
+                    break;
+                };
+            }
         }
         log::info!("RenderActor: exiting")
+    }
+
+    fn render_svg(&mut self, document: &TypstDocument) -> Vec<Vec<u8>> {
+        match document {
+            TypstDocument::Paged(doc) => {
+                let total = doc.pages().len();
+                log::info!("RenderActor: render_svg: Paged document with {total} pages");
+                if total == 0 {
+                    return Vec::new();
+                }
+                let options = typst_svg::SvgOptions::default();
+                doc.pages()
+                    .iter()
+                    .enumerate()
+                    .map(|(index, page)| {
+                        let svg = typst_svg::svg(page, &options);
+                        let svg_bytes = if self.strip_svg_glyph_defs {
+                            strip_cached_glyph_defs(&mut self.cached_glyph_defs_hashes, index, svg)
+                        } else {
+                            svg.into_bytes()
+                        };
+                        let header = format!("page:{index}:{total}\n");
+                        let mut data = header.into_bytes();
+                        data.extend_from_slice(&svg_bytes);
+                        data
+                    })
+                    .collect()
+            }
+            TypstDocument::Html(_) => {
+                log::info!("RenderActor: render_svg: Html document (not supported)");
+                vec![b"<svg xmlns=\"http://www.w3.org/2000/svg\"><text>HTML target not supported in SVG mode</text></svg>".to_vec()]
+            }
+        }
     }
 
     fn render(&mut self, has_full_render: bool, document: &TypstDocument) -> Vec<u8> {
@@ -339,5 +409,71 @@ impl OutlineRenderActor {
                 crate::outline::outline(interner, document)
             })
             .await
+    }
+}
+
+fn compile_error_frame(errors: &[String]) -> String {
+    let payload = serde_json::json!({
+        "kind": "compileError",
+        "errors": errors,
+    });
+    format!("error\n{payload}\n")
+}
+
+fn strip_cached_glyph_defs(
+    cache: &mut HashMap<usize, u64>,
+    page_index: usize,
+    svg: String,
+) -> Vec<u8> {
+    let defs_start_tag = "<defs id=\"glyph\">";
+    let defs_end_tag = "</defs>";
+
+    let Some(start) = svg.find(defs_start_tag) else {
+        return svg.into_bytes();
+    };
+    let Some(end_rel) = svg[start..].find(defs_end_tag) else {
+        return svg.into_bytes();
+    };
+    let end = start + end_rel + defs_end_tag.len();
+    let defs_section = &svg[start..end];
+
+    let mut hasher = DefaultHasher::new();
+    hasher.write(defs_section.as_bytes());
+    let hash = hasher.finish();
+
+    let cached = cache.get(&page_index).copied();
+    if cached == Some(hash) {
+        let mut result = String::with_capacity(svg.len() - defs_section.len());
+        result.push_str(&svg[..start]);
+        result.push_str(&svg[end..]);
+        result.into_bytes()
+    } else {
+        cache.insert(page_index, hash);
+        svg.into_bytes()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{compile_error_frame, strip_cached_glyph_defs};
+    use std::collections::HashMap;
+
+    #[test]
+    fn compile_error_frame_is_text_protocol() {
+        let frame = compile_error_frame(&["unknown variable: x".to_owned()]);
+        assert_eq!(
+            frame,
+            "error\n{\"errors\":[\"unknown variable: x\"],\"kind\":\"compileError\"}\n"
+        );
+    }
+
+    #[test]
+    fn unchanged_glyph_defs_are_stripped_after_first_frame() {
+        let mut cache = HashMap::new();
+        let svg = "<svg><defs id=\"glyph\"><path d=\"M0\"/></defs><use href=\"#a\"/></svg>";
+        let first = strip_cached_glyph_defs(&mut cache, 0, svg.to_owned());
+        assert_eq!(first, svg.as_bytes());
+        let second = strip_cached_glyph_defs(&mut cache, 0, svg.to_owned());
+        assert_eq!(second, b"<svg><use href=\"#a\"/></svg>");
     }
 }
